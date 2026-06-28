@@ -40,13 +40,23 @@ function rgbToHsl(r, g, b) {
 
 // 0 transparent, 1 base, 2 rim, 3 shadow, 6 eye pupil, 7 eye highlight.
 // Saturations + lightnesses per role come from cfg; hue comes from the
-// smoothed RGB color and is converted via rgbToHsl. The role saturation is
-// scaled by the RGB-derived saturation so during a transition through gray
-// the sprite briefly desaturates instead of staying at a stuck hue.
+// smoothed RGB color and is converted via rgbToHsl. While music is playing
+// (colorGateActive) a transition through gray must not wash the sprite out
+// or flash hueFallback blue — hold the last stable hue and keep the role
+// saturation above colorSatFloor. With the gate off (ambient/idle) the raw
+// mapping applies unchanged, so the calm idle look is untouched.
 function paletteForRgb(r, g, b) {
   const { h, s } = rgbToHsl(r, g, b);
-  const hi = Math.round(h);
-  const k = Math.max(0, Math.min(1, s));   // role-sat multiplier
+  let hue = h;
+  let sat = s;
+  if (s >= 0.05) {
+    lastStableHue = h;
+  } else if (colorGateActive) {
+    hue = lastStableHue;  // rgbToHsl fell back to hueFallback — don't flash blue
+  }
+  if (colorGateActive) sat = Math.max(sat, cfg.colorSatFloor);
+  const hi = Math.round(hue);
+  const k = Math.max(0, Math.min(1, sat));   // role-sat multiplier
   return {
     1: color(`hsl(${hi}, ${Math.round(cfg.bodySaturation * k)}%, ${cfg.bodyLightness}%)`),
     2: color(`hsl(${hi}, ${Math.round(cfg.rimSaturation * k)}%, ${cfg.rimLightness}%)`),
@@ -223,9 +233,15 @@ let micRestarting = false;     // guards against double re-acquire in flight
 let micBuffer = null;         // time-domain (RMS)
 let freqBuf = null;           // frequency-domain (centroid + ODF)
 let micActive = false;
+let micLastError = null;      // DOMException.name from the last failed mic acquire (HUD + retry policy)
+let micEverActive = false;    // mic worked at least once — gates the auto-retry below
+let micRetryCount = 0;        // bounded auto-retry budget after device loss
+let micNextRetryMs = 0;       // earliest timestamp for the next auto-retry
 let smoothedLevel = 0;        // intensity (drives bounce/sway/etc — fast EMA)
 let displayLevel = 0;         // intensity for the HUD readout — slower EMA so the % doesn't flicker
 let rhythmPresence = 0;       // [0..1] gate from ODF coefficient-of-variation; suppresses broadband noise (plane airflow, HVAC) that has high RMS but no rhythmic structure
+let colorGateActive = false;  // hysteresis state for music-driven color (engages/releases at different thresholds)
+let lastStableHue = cfg.hueFallback;  // last hue with real saturation — held through gray transitions while music plays
 
 function setup() {
   createCanvas(windowWidth, windowHeight);
@@ -288,8 +304,21 @@ function draw() {
       micStream = null;
       micAnalyser = null;
       micActive = false;
+      micNextRetryMs = now + 5000;  // space the backoff retries below
       ensureMicStarted().finally(() => { micRestarting = false; });
     }
+  } else if (micEverActive && !micActive && !micRestarting &&
+      micLastError !== 'NotAllowedError' &&
+      micRetryCount < 6 && now >= micNextRetryMs) {
+    // The re-acquire above failed (device unplugged / switched away) and
+    // micStream is null, so the track-ended path can't fire again. Retry
+    // on a 5s backoff, max 6 attempts; a click always retries regardless
+    // (handlePress → ensureMicStarted).
+    micRetryCount++;
+    micNextRetryMs = now + 5000;
+    micRestarting = true;
+    dbgWarn(`Growly mic: auto-retry ${micRetryCount}/6`);
+    ensureMicStarted().finally(() => { micRestarting = false; });
   }
 
   // Intensity: raw mic RMS × gain. The rhythm-presence gate (computed
@@ -431,6 +460,19 @@ function drawHud() {
     `fps   ${(1000 / avgAnalysisDt).toFixed(0)}`,
     `audio ${audioState}`,
   ];
+  // Mic status — without this, a denied/lost mic just looks like Growly
+  // ignoring the music with no explanation.
+  if (!micActive) {
+    if (micLastError === 'NotAllowedError') {
+      lines.push('mic   denied (site settings)');
+    } else if (micEverActive) {
+      lines.push(`mic   lost — retry ${micRetryCount}/6`);
+    } else if (micLastError) {
+      lines.push('mic   unavailable — tap Growly');
+    } else {
+      lines.push('mic   tap Growly to start');
+    }
+  }
   // In gaze mode, append a diagnostic line so the user can see whether
   // the iris signal is moving at all and how much of it survives the
   // deadzone+gain pipe.
@@ -445,9 +487,11 @@ function drawHud() {
   textFont('monospace');
   textSize(14);
   textAlign(LEFT, TOP);
-  // Backdrop
+  // Backdrop — sized to the widest line so status messages don't overflow.
+  let hudW = 140;
+  for (const ln of lines) hudW = Math.max(hudW, textWidth(ln) + 12);
   fill(0, 0, 0, 160);
-  rect(8, 8, 140, 18 * lines.length + 10);
+  rect(8, 8, hudW, 18 * lines.length + 10);
   fill(255);
   for (let i = 0; i < lines.length; i++) {
     text(lines[i], 14, 14 + i * 18);
@@ -472,8 +516,8 @@ function analyzeSpectrum(now) {
   // bandBass → red, bandMid → green, bandHigh → magenta (R+B).
   // Mixing in RGB lets bass+mid render as yellow, mid+high as gray-cyan,
   // all-bands as near-white — and importantly avoids hue-wheel detours
-  // through red/blue during transitions. Below intensityThreshold the
-  // mic is treated as silent and the ambient color is used.
+  // through red/blue during transitions. When the color gate below is
+  // closed the ambient color is used.
   function bandEnergy(loHz, hiHz) {
     const lo = Math.max(1, Math.ceil(loHz / binHz));
     const hi = Math.min(binCount - 1, Math.floor(hiHz / binHz));
@@ -485,13 +529,26 @@ function analyzeSpectrum(now) {
   let targetG = cfg.ambientRgb[1];
   let targetB = cfg.ambientRgb[2];
   // Music-driven color is gated on rhythm-presence (the ODF CV signal),
-  // not on the raw level. Empirically smoothedLevel can dip below
-  // intensityThreshold for stretches during legit music (quieter
-  // sections, mic distance variation, breathing-period dips of the EMA)
-  // while rhythm-presence stays clearly high. The tiny level floor is
-  // a safety against mic-dead / 0-input scenarios — anything above
-  // background floor passes.
-  if (rhythmPresence >= cfg.rhythmGateForColor && smoothedLevel >= 0.04) {
+  // not on the raw level. Empirically smoothedLevel can dip below the
+  // floor for stretches during legit music (quieter sections, mic
+  // distance variation, breathing-period dips of the EMA) while
+  // rhythm-presence stays clearly high. The tiny level floor is a safety
+  // against mic-dead / 0-input scenarios — anything above background
+  // floor passes. Hysteresis: the gate engages at rhythmGateForColor but
+  // only releases below rhythmGateForColorExit, so a vocal breath that
+  // grazes the threshold doesn't flick the color to ambient and back.
+  // BPM estimation and silence-reset below intentionally keep the plain
+  // threshold — hysteresis here is a color-only concern.
+  if (colorGateActive) {
+    if (rhythmPresence < cfg.rhythmGateForColorExit ||
+        smoothedLevel < cfg.colorLevelFloor) {
+      colorGateActive = false;
+    }
+  } else if (rhythmPresence >= cfg.rhythmGateForColor &&
+      smoothedLevel >= cfg.colorLevelFloor) {
+    colorGateActive = true;
+  }
+  if (colorGateActive) {
     const eB = bandEnergy(cfg.bandBassHz[0], cfg.bandBassHz[1]) * cfg.bandBassGain;
     const eM = bandEnergy(cfg.bandMidHz[0], cfg.bandMidHz[1])   * cfg.bandMidGain;
     const eH = bandEnergy(cfg.bandHighHz[0], cfg.bandHighHz[1]) * cfg.bandHighGain;
@@ -660,6 +717,18 @@ function analyzeSpectrum(now) {
       muted: _track.muted,
       enabled: _track.enabled,
     } : 'no track',
+    mic: {
+      active: micActive,
+      lastError: micLastError,
+      retryCount: micRetryCount,
+    },
+    face: {
+      trackingActive: faceTrackingActive,
+      meshReady: !!faceMesh,
+      streamLive: !!(faceVideo && faceVideo.srcObject &&
+        faceVideo.srcObject.getVideoTracks().some((t) => t.readyState === 'live')),
+    },
+    colorGateActive,
     silenceMs: silenceStartMs ? (now - silenceStartMs) : 0,
     tempoHistN: tempoEstimates.length,
   };
@@ -1020,8 +1089,15 @@ async function ensureMicStarted() {
     micBuffer = new Float32Array(analyser.fftSize);
     freqBuf = new Uint8Array(analyser.frequencyBinCount);
     micActive = true;
+    micEverActive = true;
+    micLastError = null;
+    micRetryCount = 0;
   } catch (e) {
-    // permission denied or no mic — stay calm
+    // Permission denied or no mic — stay calm, but remember why so the
+    // HUD can say so and the auto-retry can decide whether to bother
+    // (NotAllowedError never auto-retries: Chrome auto-denies repeats).
+    micLastError = (e && e.name) ? e.name : 'UnknownError';
+    dbgWarn('Growly mic: acquire failed —', micLastError);
   }
 }
 
@@ -1038,9 +1114,10 @@ function handlePress(event) {
   // that button lives outside the canvas as a fixed-position DOM element.
   if (event && event.target && event.target.tagName === 'BUTTON') return false;
   ensureMicStarted();
-  // Face tracking is on by default; kick off init on the first user gesture
-  // since getUserMedia requires one.
-  if (faceTrackingActive && !faceMesh) {
+  // Face tracking is on by default; init (or re-acquire a lost camera) on
+  // a user gesture since getUserMedia requires one. No-ops when the mesh
+  // and stream are already live.
+  if (faceTrackingActive) {
     ensureFaceTracker().then((ok) => {
       if (ok) startFacePump(); else faceTrackingActive = false;
       updateFaceButton();
@@ -1127,8 +1204,55 @@ let faceMeshInitPromise = null;
 let facePumpInflight = false;
 let facePumpScheduled = false;
 
+// Stop the webcam: end all tracks so the browser's recording indicator goes
+// dark. Keeps the <video> element (cheap) and faceMesh (expensive WASM init)
+// for a later re-enable; removeEl=true also discards the element — used when
+// init fails partway so the retry starts from a clean slate.
+function stopFaceStream(removeEl = false) {
+  if (!faceVideo) return;
+  try { faceVideo.pause(); } catch {}
+  const s = faceVideo.srcObject;
+  if (s) { try { s.getTracks().forEach((t) => t.stop()); } catch {} }
+  faceVideo.srcObject = null;
+  if (removeEl) {
+    faceVideo.remove();
+    faceVideo = null;
+  }
+}
+
+// Acquire (or re-acquire) the webcam and attach it to the hidden <video>.
+// Split out from mesh init because toggle-OFF stops the stream (privacy:
+// OFF must mean camera off) while the mesh survives — toggle-ON only needs
+// the stream back.
+async function ensureFaceStream() {
+  const live = faceVideo && faceVideo.srcObject &&
+    faceVideo.srcObject.getVideoTracks().some((t) => t.readyState === 'live');
+  if (live) return true;
+  try {
+    dbg('Growly face: requesting webcam…');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 320, height: 240, facingMode: 'user' },
+      audio: false,
+    });
+    dbg('Growly face: webcam OK, attaching to <video>');
+    if (!faceVideo) {
+      faceVideo = document.createElement('video');
+      faceVideo.style.display = 'none';
+      faceVideo.playsInline = true;
+      faceVideo.muted = true;
+      document.body.appendChild(faceVideo);
+    }
+    faceVideo.srcObject = stream;
+    await faceVideo.play();
+    return true;
+  } catch (e) {
+    console.error('Growly face: webcam acquire failed:', e);
+    return false;
+  }
+}
+
 async function ensureFaceTracker() {
-  if (faceMesh) return true;
+  if (faceMesh) return ensureFaceStream();  // mesh ready — just need the camera back
   if (faceMeshInitPromise) return faceMeshInitPromise;
   if (typeof FaceMesh === 'undefined') {
     console.error('Growly face: MediaPipe FaceMesh not loaded from CDN');
@@ -1136,23 +1260,15 @@ async function ensureFaceTracker() {
   }
   faceMeshInitPromise = (async () => {
     try {
-      dbg('Growly face: requesting webcam…');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 320, height: 240, facingMode: 'user' },
-        audio: false,
-      });
-      dbg('Growly face: webcam OK, attaching to <video>');
-      faceVideo = document.createElement('video');
-      faceVideo.style.display = 'none';
-      faceVideo.playsInline = true;
-      faceVideo.muted = true;
-      faceVideo.srcObject = stream;
-      document.body.appendChild(faceVideo);
-      await faceVideo.play();
+      if (!(await ensureFaceStream())) {
+        faceMeshInitPromise = null;
+        return false;
+      }
       dbg('Growly face: video playing; constructing FaceMesh');
 
       const mesh = new FaceMesh({
-        locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`,
+        // Version pinned in lockstep with the <script> tag in index.html.
+        locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${f}`,
       });
       mesh.setOptions({
         maxNumFaces: 2,
@@ -1188,6 +1304,10 @@ async function ensureFaceTracker() {
       return true;
     } catch (e) {
       console.error('Growly face init failed:', e);
+      // A mid-init failure after the webcam was acquired would otherwise
+      // leak a live camera (indicator on, nothing tracking) — and each
+      // retry would acquire another. Release everything.
+      stopFaceStream(true);
       faceMeshInitPromise = null;  // allow a retry
       return false;
     }
@@ -1200,7 +1320,10 @@ async function ensureFaceTracker() {
 // facePumpScheduled prevents duplicate timers when the user re-toggles ON.
 function facePumpStep() {
   facePumpScheduled = false;
-  if (!faceTrackingActive || !faceMesh || !faceVideo) {
+  const faceTrack = faceVideo && faceVideo.srcObject &&
+    faceVideo.srcObject.getVideoTracks()[0];
+  if (!faceTrackingActive || !faceMesh ||
+      !faceTrack || faceTrack.readyState !== 'live') {
     facePumpInflight = false;
     return;
   }
@@ -1355,24 +1478,28 @@ window.addEventListener('DOMContentLoaded', () => {
   btn.addEventListener('click', async (e) => {
     e.stopPropagation();
     if (faceTrackingActive) {
-      // Turn off
+      // Turn off — and actually release the camera so the browser's
+      // recording indicator goes dark. OFF must mean off.
       faceTrackingActive = false;
       lastFaceLandmarks = null;
+      stopFaceStream();
       updateFaceButton();
     } else {
-      // Turn on. If the mesh hasn't been initialized yet (first activation
-      // ever), do that now; otherwise just re-arm the pump.
+      // Turn on. ensureFaceTracker initializes the mesh on first-ever
+      // activation and re-acquires the webcam (stopped on toggle-off)
+      // on every later one.
       faceTrackingActive = true;
-      if (!faceMesh) {
-        btn.disabled = true;
-        btn.textContent = 'Face tracking: starting…';
-        const ok = await ensureFaceTracker();
-        btn.disabled = false;
-        if (!ok) {
-          faceTrackingActive = false;
-          btn.textContent = 'Face tracking: failed';
-          return;
-        }
+      btn.disabled = true;
+      // "starting…" covers both first-ever mesh init and a camera
+      // re-acquire (mesh present, stream was stopped on toggle-off) —
+      // either way there's a sub-second async gap before tracking resumes.
+      btn.textContent = faceMesh ? 'Face tracking: resuming…' : 'Face tracking: starting…';
+      const ok = await ensureFaceTracker();
+      btn.disabled = false;
+      if (!ok) {
+        faceTrackingActive = false;
+        btn.textContent = 'Face tracking: failed';
+        return;
       }
       startFacePump();
       updateFaceButton();

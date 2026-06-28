@@ -34,7 +34,8 @@ window.GROWLY_CONFIG = {
   ambientRgb: [0.15, 0.35, 1.0],  // color when no music is detected
   pitchSmoothing: 0.18,           // EMA on RGB — ~2s drift to ambient when music stops
   hueFallback: 220,               // hue used only when smoothed RGB is gray
-  intensityThreshold: 0.18,       // level floor for music-driven color (combined with rhythm gate below)
+  colorLevelFloor: 0.04,          // tiny level safety floor under the color gate (mic-dead / 0-input guard)
+  colorSatFloor: 0.35,            // min role-saturation multiplier while the color gate is active
 
   // ----- Music-vs-noise detection -----
   // The rhythm gate distinguishes music (spiky onsets, high std/mean on the
@@ -44,13 +45,14 @@ window.GROWLY_CONFIG = {
   //
   // Gating layout (intentional asymmetry):
   //   Bouncing       — ungated; any audio moves Growly
-  //   Color update   — needs both intensityThreshold AND rhythmGateForColor
+  //   Color update   — needs colorLevelFloor AND the rhythm gate (with hysteresis)
   //   BPM detection  — needs rhythmGateForColor; level is misleading on slow tracks
   rhythmCvFloor: 0.15,
   rhythmCvCeiling: 0.40,
   rhythmPresenceSmoothing: 0.04,          // attack: ~quick on new rhythm
   rhythmPresenceReleaseSmoothing: 0.008,  // release: ~10-15s tail bridges sustained notes
   rhythmGateForColor: 0.05,               // presence threshold for music color & BPM lock
+  rhythmGateForColorExit: 0.03,           // hysteresis: color gate releases below this once engaged
 
   // ----- BPM detection -----
   // Spectral-flux ODF → autocorrelation w/ comb filter → Gaussian prior
@@ -71,7 +73,7 @@ window.GROWLY_CONFIG = {
   bpmOctaveMin: 80,               // fold-to-here on under
   bpmOctaveMax: 160,              // fold-to-half on over
   bpmOutlierTolerance: 0.15,      // |estimate - median| / median > this → suspicious
-  bpmOutlierConfirmations: 7,     // ~3s of clustered outliers to flush a stuck lock
+  bpmOutlierConfirmations: 5,     // ~2s of clustered outliers to flush a stuck lock
   bpmOutlierStabilityStdMax: 14,  // …and they must agree (std < this BPM)
   silenceResetMs: 4000,           // 4s of rhythmPresence below gate → reset BPM
 

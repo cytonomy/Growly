@@ -15,7 +15,10 @@ Live: <https://cytonomy.github.io/growly/>
 | **No music / silence** | Defaults to a **slow micro-jiggle** (~35 BPM, sub-pixel lift, NEUTRAL frame only) so he's never completely still. |
 | **Click / tap** | Hops toward the click point in a series of arc'd jumps (independent of the audio loop). Mobile-friendly: works on touch. |
 
-The first tap also grants mic permission. Without mic access, Growly skips audio reactivity and stays at the silent-default behavior.
+## Permissions
+
+- **Microphone** — requested on the first tap (browsers require a user gesture). Without it, Growly skips audio reactivity and stays at the silent-default behavior; the HUD shows why (`mic denied` / `mic lost`). If the mic device drops mid-session, Growly retries automatically (5s backoff, 6 attempts) and any tap retries immediately. If you denied permission, re-enable it in the browser's site settings (the lock icon in the address bar) — repeated taps won't re-prompt.
+- **Camera** — only used by the optional face-tracking toggle (Growly's eyes follow your face or gaze). Turning the toggle **OFF stops the camera entirely** (the recording indicator goes dark); turning it back on re-requests the stream. All processing is local (MediaPipe FaceMesh in-browser); nothing is recorded or sent anywhere.
 
 ## Tuning
 
@@ -32,9 +35,11 @@ Notable knobs:
 - `bandBassHz` / `bandMidHz` / `bandHighHz` — frequency ranges (Hz) for each of the three band-energy buckets that drive color
 - `bandBassGain` / `bandMidGain` / `bandHighGain` — per-band weight multipliers. The natural music spectrum rolls off at high frequency so the high band reads weaker per bin; bump `bandHighGain` to make sparkly/cymbal moments register stronger.
 - `bandHighRedShare` / `bandHighBlueShare` — how much of the high-band energy leaks into R vs B; together they shape what "pure highs" look like (default both 0.9 = pink-magenta)
-- `ambientRgb` — `[r, g, b]` shown when `smoothedLevel` is below `intensityThreshold` (default light blue)
+- `ambientRgb` — `[r, g, b]` shown when the color gate is closed (no rhythmic music detected; default light blue)
 - `pitchSmoothing` — EMA on the RGB color (lower = slower, more dramatic dwell)
-- `intensityThreshold` — below this smoothed level, color falls back to ambient AND silence-reset begins counting toward dropping the BPM lock
+- `rhythmGateForColor` / `rhythmGateForColorExit` — rhythm-presence thresholds for the music-color gate; the gate engages at the first and only releases below the second (hysteresis), so a vocal breath grazing the threshold doesn't flicker the color
+- `colorLevelFloor` — tiny level safety floor under the color gate (guards the mic-dead / zero-input case)
+- `colorSatFloor` — minimum saturation while music plays, so transitions through gray don't wash the sprite out
 - `bpmConfidenceThreshold` — how dominant the autocorrelation peak must be before we commit a new tempo
 - `bpmOutlierTolerance` / `bpmOutlierConfirmations` / `bpmOutlierStabilityStdMax` — once locked, an alternative tempo must (a) drift far enough, (b) repeat for `bpmOutlierConfirmations × bpmEstimateIntervalMs` worth of estimates, and (c) cluster tightly (std under `bpmOutlierStabilityStdMax`) before it can flush the lock. Random mic noise scatters too widely to ever pass.
 - `silenceResetMs` — how long the room must be quiet before Growly drops his current tempo lock and reverts to `bpmFallback`
@@ -53,4 +58,9 @@ Then open <http://localhost:8081>.
 
 - `index.html` — page shell, loads p5.js + config.js + sketch.js (cache-busted on every load)
 - `config.js` — all tunable parameters
-- `sketch.js` — sprites, idle/hop animation, audio analysis pipeline
+- `sketch.js` — sprites, idle/hop animation, audio analysis pipeline, face tracking
+
+Local-only (gitignored, not part of the deployed site):
+
+- `test_tracks/` — reference audio for tuning the BPM pipeline. Copyrighted material; kept out of the repo on purpose — never commit it.
+- `.venv-test/` — Python venv for the BPM analysis scripts in `test_tracks/`. Dev harness only; not needed to run Growly.

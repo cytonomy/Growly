@@ -47,16 +47,29 @@
     #mode-toggle.gaze { border-color: rgba(120, 200, 255, 0.6); color: rgb(150, 200, 255); }
     #mode-toggle[hidden] { display: none; }
   </style>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"
+          integrity="sha384-6Twx1hAeKnwfOYJAHtYeJETRiGD5pRPkjjh0pVbG1QoesncjOpw5e75Y1kOkXeRI"
+          crossorigin="anonymous"></script>
+  <!-- Version pinned in lockstep with locateFile in sketch.js. No SRI: the
+       loader fetches further versioned assets at runtime that SRI can't
+       cover anyway, and pinning alone prevents silent upstream drift. -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js"></script>
 </head>
 <body>
   <button id="face-toggle" aria-label="Toggle face tracking overlay">Face tracking: OFF</button>
   <button id="mode-toggle" aria-label="Switch between face-position and iris-gaze tracking" hidden>Mode: Face</button>
   <script>
-    var v = Date.now();
-    document.write('<script src="config.js?v=' + v + '"><\/script>');
-    document.write('<script src="sketch.js?v=' + v + '"><\/script>');
+    // If the p5 CDN failed (offline, blocked, SRI mismatch) sketch.js would
+    // die on its first p5 global with a blank page — say so instead.
+    if (typeof p5 === 'undefined') {
+      document.body.innerHTML =
+        '<p style="color:#eee;font-family:monospace;padding:24px">' +
+        'Growly failed to load p5.js from the CDN — check your connection and reload.</p>';
+    } else {
+      var v = Date.now();
+      document.write('<script src="config.js?v=' + v + '"><\/script>');
+      document.write('<script src="sketch.js?v=' + v + '"><\/script>');
+    }
   </script>
 </body>
 </html>
